@@ -1,11 +1,9 @@
-import logging
-
-import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from app.github import fetch_issues, save_issues
-
-logger = logging.getLogger(__name__)
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
+from app.jobs import ingest_repo
+from app.queues import ingest_queue, redis_conn
 
 app = FastAPI()
 
@@ -14,32 +12,30 @@ class IngestRequest(BaseModel):
 
 class IngestResponse(BaseModel):
     repo: str
-    count: int
+    job_id: str
 
-@app.post("/ingest")
+@app.post("/ingest", status_code=202)
 def ingest(body: IngestRequest) -> IngestResponse:
     owner, repo = body.repo.split("/")
-    try:
-        items = fetch_issues(owner, repo)
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-        logger.warning("GitHub returned %s for %s", status, body.repo)
-        if status == 404:
-            raise HTTPException(404, f"Repository '{body.repo}' not found") from exc
-        if status in (401, 403, 429):
-            raise HTTPException(502, "GitHub rejected the request (token or rate limit)") from exc
-        raise HTTPException(502, f"GitHub returned {status}") from exc
-    except httpx.RequestError as exc:
-        logger.warning("Could not reach GitHub for %s: %s", body.repo, exc)
-        raise HTTPException(504, "Could not reach GitHub") from exc
 
-    try:
-        save_issues(owner, repo, items)
-    except OSError as exc:
-        logger.exception("Failed writing %s", body.repo)
-        raise HTTPException(500, "Failed to write ingested data") from exc
+    job = ingest_queue.enqueue(ingest_repo, owner, repo)
 
-    return {"repo": body.repo, "count": len(items)}
+    return IngestResponse(repo=body.repo, job_id=job.id)
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except NoSuchJobError:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status = job.get_status()
+    if status == "finished":
+        return {"status": status, "result": job.return_value()}
+    elif status == "failed":
+        return {"status": status, "error": "Job failed. Check the worker logs for details."}
+    else:
+        return {"status": status}
 
 @app.get("/health")
 def health():
