@@ -37,17 +37,42 @@ Create a `.env` file with a GitHub personal access token (classic, `public_repo`
 GITHUB_TOKEN=ghp_xxxxx
 ```
 
-Three terminals:
+Bring up all three services:
 
 ```bash
-docker compose up -d                                    # Redis
-uvicorn app.main:app --reload                           # API
-rq worker ingest --url redis://localhost:6379/0         # worker
+docker compose up --build
 ```
 
-On Windows the worker needs `--worker-class rq.SimpleWorker`, because RQ's default worker forks and `os.fork()` doesn't exist there.
+That starts Redis, the API on port 8000, and a worker — the API and worker run the same image with different commands.
 
 Interactive docs at http://localhost:8000/docs.
+
+<details>
+<summary>Running without containers</summary>
+
+```bash
+pip install -r requirements-dev.txt
+docker compose up -d redis
+uvicorn app.main:app --reload
+rq worker ingest --url redis://localhost:6379/0 --worker-class rq.SimpleWorker
+```
+
+`--worker-class rq.SimpleWorker` is only needed on Windows: RQ's default worker forks a child per job and `os.fork()` doesn't exist there. In the container the worker runs on Linux, so the default forking worker is used — which also means a crashed job can't take the worker down with it.
+
+</details>
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Eleven tests, no live Redis or network needed — GitHub is mocked with `respx` and the queue is stubbed. They cover the pagination loop's termination (including the exact-multiple-of-100 edge case), the rate-limit retry and when it gives up, request validation, and that `POST /ingest` enqueues rather than crawling.
+
+CI runs them on every push, then builds the Docker image.
 
 ---
 
