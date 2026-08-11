@@ -142,6 +142,6 @@ Per-page cost is effectively constant across two unrelated repos, so ingest time
 
 ## Next
 
-- Dockerfiles for API and worker, all three services under one `docker compose up`
-- Tests and CI
-- Chunking, embeddings, and an `/ask` endpoint
+- Chunking, embeddings, and an `/ask` endpoint — the ingested history isn't queryable yet
+- Deterministic job IDs, so a second `/ingest` for an in-flight repo collides instead of running the crawl twice
+- Atomic writes to `data/` — the current save truncates and rewrites, which is only safe with one worker
