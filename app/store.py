@@ -8,7 +8,6 @@ BATCH_SIZE = 5000
 
 _collection = None
 
-
 def get_collection():
     global _collection
     if _collection is None:
@@ -16,6 +15,12 @@ def get_collection():
         _collection = client.get_or_create_collection(COLLECTION)
     return _collection
 
+def repo_indexed(repo: str) -> bool:
+    """Return True if the repo has been indexed in Chroma."""
+    collection = get_collection()
+    # Check if any documents exist for this repo
+    response = collection.get(where={"repo_whole": repo}, limit=1)
+    return len(response["ids"]) > 0
 
 def chunk_id(chunk: dict) -> str:
     """Stable, unique id for one chunk."""
@@ -23,6 +28,8 @@ def chunk_id(chunk: dict) -> str:
     return f"{chunk['repo_whole']}-{chunk['number']}"
 
 
+# Chroma rejects None metadata values, so None keys are dropped rather than stored.
+# Readers must not assume every metadata key comes back. Only user_login is ever None today.
 def add_chunks(chunks: list[dict]) -> int:
     collection = get_collection()
     for start in range(0, len(chunks), BATCH_SIZE):
@@ -36,15 +43,11 @@ def add_chunks(chunks: list[dict]) -> int:
     return len(chunks)
 
 
-def search(query: str, limit: int = 5) -> list[dict]:
+# Here repo is the whole repo name, e.g. "fastapi/fastapi"
+def search(query: str, repo: str, limit: int = 5) -> list[dict]:
     collection = get_collection()
-    response = collection.query(query_texts=[query], n_results=limit)
+    response = collection.query(query_texts=[query], n_results=limit, where={"repo_whole": repo})
 
-    # TODO: you write this.
-    # Chroma answers many queries at once, so every key is a list of lists -
-    # response["documents"] is [[doc, doc, ...]]. You sent one query, so you want
-    # index 0 of each. Zip the parallel lists back into one dict per hit, and keep
-    # "distances" - it is how you tell a good match from a desperate one.
     return [
         {
             "text": text,
@@ -68,5 +71,5 @@ if __name__ == "__main__":
     print(f"indexing {len(chunks)} chunks...")
     add_chunks(chunks)
 
-    for hit in search("how do I handle authentication with dependencies"):
+    for hit in search("how do I handle authentication with dependencies", f"{owner}/{repo}", limit=5):
         print(hit)
