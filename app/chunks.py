@@ -3,9 +3,6 @@ import re
 
 from app.github import DATA_DIR
 
-# TODO: you write these two.
-# MIN_CHARS - below this a chunk is noise ("Fixes #4521"). 200 keeps 95% of issues, 40% of PRs.
-# MAX_CHARS - above this you truncate for now, window later. ~4% of records exceed 6000.
 MIN_CHARS = 200
 MAX_CHARS = 6000
 
