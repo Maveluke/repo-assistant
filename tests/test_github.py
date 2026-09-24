@@ -63,11 +63,11 @@ def test_retries_once_after_rate_limit(issue_page, monkeypatch):
 
 
 @respx.mock
-def test_gives_up_when_reset_is_too_far_away(issue_page, monkeypatch):
+def test_gives_up_when_reset_is_too_far_away(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
 
     reset_at = str(int(time.time()) + 3600)
-    respx.get(ISSUES_URL).mock(
+    route = respx.get(ISSUES_URL).mock(
         return_value=httpx.Response(403, headers={"x-ratelimit-reset": reset_at})
     )
 
@@ -77,3 +77,4 @@ def test_gives_up_when_reset_is_too_far_away(issue_page, monkeypatch):
         assert exc.response.status_code == 403
     else:
         raise AssertionError("expected HTTPStatusError")
+    assert route.call_count == 1
