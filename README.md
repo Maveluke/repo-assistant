@@ -2,13 +2,13 @@
 
 A Python backend service that ingests a GitHub repository's full issue and pull request history and makes it queryable. The premise is that the *why* behind a codebase — why a decision was made, why an approach was rejected — is buried in closed issues and PR threads nobody reads. This surfaces it.
 
-**Current state:** ingestion runs asynchronously through a Redis-backed job queue. Retrieval and question answering are next.
+**Current state:** ingestion runs asynchronously through a Redis-backed job queue, and `POST /ask` returns the issues and PRs most relevant to a question by semantic search. Indexing for `/ask` is still a manual step, and generated answers are next.
 
 ---
 
 ## Architecture
 
-Three processes that share nothing but Redis:
+Three processes. The API and worker coordinate only through Redis, and share the `data/` directory for storage:
 
 ```
    POST /ingest                        rq worker
@@ -20,6 +20,8 @@ Three processes that share nothing but Redis:
 ```
 
 The API never touches GitHub. It writes a job — a function reference plus arguments — into Redis and returns a ticket. The worker, a separate process, claims it and does the ~114 seconds of crawling. Job state lives in Redis because that's the only thing both processes can see.
+
+`POST /ask` doesn't touch the queue. The API queries a Chroma index stored under `data/chroma` directly.
 
 ---
 
@@ -43,7 +45,7 @@ Bring up all three services:
 docker compose up --build
 ```
 
-That starts Redis, the API on port 8000, and a worker — the API and worker run the same image with different commands.
+That starts Redis, the API on port 8000, and a worker. The API and worker are built from the same Dockerfile and differ only in their command.
 
 Interactive docs at http://localhost:8000/docs.
 
@@ -61,6 +63,16 @@ rq worker ingest --url redis://localhost:6379/0 --worker-class rq.SimpleWorker
 
 </details>
 
+### Indexing for `/ask`
+
+Indexing isn't part of the ingest job yet. After ingesting `fastapi/fastapi`, build its index with:
+
+```bash
+python -m app.store
+```
+
+The repo is hard-coded in `app/store.py`. The first run downloads Chroma's default embedding model.
+
 ---
 
 ## Tests
@@ -70,7 +82,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Eleven tests, no live Redis or network needed — GitHub is mocked with `respx` and the queue is stubbed. They cover the pagination loop's termination (including the exact-multiple-of-100 edge case), the rate-limit retry and when it gives up, request validation, and that `POST /ingest` enqueues rather than crawling.
+Eleven tests, no live Redis or network needed — GitHub is mocked with `respx` and the queue is stubbed. They cover the pagination loop's termination (including the exact-multiple-of-100 edge case), the rate-limit retry and when it gives up, request validation, and that `POST /ingest` enqueues rather than crawling. Chunking, indexing, and `/ask` have no tests yet.
 
 CI runs them on every push, then builds the Docker image.
 
@@ -83,6 +95,7 @@ CI runs them on every push, then builds the Docker image.
 | `GET` | `/health` | Liveness check. |
 | `POST` | `/ingest` | Enqueues a crawl. Returns `202` with a job ID immediately. |
 | `GET` | `/jobs/{id}` | Job status: `queued` / `started` / `finished` / `failed`. |
+| `POST` | `/ask` | Returns the indexed issues and PRs closest to a question. `404` if the repo isn't indexed. |
 
 ```bash
 curl -X POST localhost:8000/ingest \
@@ -92,14 +105,20 @@ curl -X POST localhost:8000/ingest \
 
 curl localhost:8000/jobs/c12d3fbf-...
 # {"status":"finished","result":{"owner":"fastapi","repo":"fastapi","records_count":9708}}
+
+curl -X POST localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"repo":"fastapi/fastapi","question":"how do I handle authentication with dependencies","limit":3}'
+# {"question":"...","sources":[{"number":...,"title":"...","html_url":"...","type":"issue","state":"closed","distance":...,"excerpt":"..."}]}
 ```
 
-Repos are validated as `owner/repo` by Pydantic before the handler runs.
+Repos are validated as `owner/repo` by Pydantic before the handler runs. `/ask` also bounds `question` to 3–500 characters and `limit` to 1–20.
 
-Two behaviours worth knowing rather than discovering:
+Three behaviours worth knowing rather than discovering:
 
 - **A nonexistent repo still returns 202.** The API can't know at response time — it never contacts GitHub. The failure surfaces through `/jobs/{id}` as `failed`. That's the cost of going asynchronous, not a bug.
 - **Finished jobs disappear after 500 seconds.** RQ's `result_ttl` expires them, so polling an old job ID returns 404 even though it succeeded.
+- **`/ask` returns 404 for a freshly ingested repo.** The ingest job stores raw JSON only. Nothing is searchable until it's indexed (see [Indexing](#indexing-for-ask)).
 
 ---
 
@@ -113,6 +132,8 @@ Same repo, same machine, before and after moving ingestion off the request path.
 | Queued (Aug 8) | **3.3 – 5.9 ms** |
 
 The first request after a restart costs ~2.1 s for lazy imports and Redis pool setup; the figures above are steady-state.
+
+How each was measured: the synchronous figure is `time.perf_counter()` around the work the old endpoint did inline (`fetch_issues` + `save_issues`). The queued figure is client-side, `Measure-Command` against a warm uvicorn over four requests.
 
 The crawl itself still takes ~114 seconds — the queue did not make it faster, it moved it off the request path. What changed is that the client is no longer holding a connection open while it happens.
 
@@ -138,10 +159,13 @@ Per-page cost is effectively constant across two unrelated repos, so ingest time
 
 **Pagination counts pages rather than following the `Link` header.** Simpler, with no string parsing. The tradeoff is that requests must run sequentially, since a page's existence isn't known until the previous one returns short — `Link`'s `rel="last"` would allow the crawl to be parallelised.
 
+**Rate limiting is a guard, not a strategy.** On a 403 or 429, a page request retries once if `x-ratelimit-reset` is within 60 seconds. Otherwise the job fails. It ignores `retry-after` and doesn't throttle ahead of the limit. At ~1.16 s per page one worker makes about 3,100 requests an hour, under a token's 5,000, so the limit only comes into play with several workers sharing a token.
+
 ---
 
 ## Next
 
-- Chunking, embeddings, and an `/ask` endpoint — the ingested history isn't queryable yet
+- Index inside the ingest job, so `/ask` works for any ingested repo
+- Generated answers from the retrieved sources
 - Deterministic job IDs, so a second `/ingest` for an in-flight repo collides instead of running the crawl twice
 - Atomic writes to `data/` — the current save truncates and rewrites, which is only safe with one worker
